@@ -41,7 +41,6 @@ typedef struct
 	unsigned int size;			//current size
 	u_char *begin;				//where to match url
 	ngx_chain_t *out;			//out chains
-	u_char *js_pos;				//pos to insert jslib, <script src='asdfa'>jspos
 	ngx_int_t type;				//update in StartElement for CdataBlock
 
 } ngx_http_html_ctx_t;
@@ -106,7 +105,7 @@ static htmlSAXHandler saxHandler =
 	NULL,
 	NULL,
 	NULL,
-	NULL,
+	NULL,                     
 	NULL,
 	NULL,
 	NULL,
@@ -578,7 +577,7 @@ END:
 #define KEYNAME_LEN 32
 #define neti_js_lib_str "<script type=\"text/javascript\" src=\"/js/neti_def.js\"></script>\n"
 
-ngx_chain_t* js_lib_node;
+ngx_buf_t* js_lib_buf;
 
 static void StartElement(void *voidContext, const xmlChar *name, const xmlChar **attrs)
 {
@@ -594,27 +593,6 @@ static void StartElement(void *voidContext, const xmlChar *name, const xmlChar *
 	int url_key_len;
 
 	ctx = (ngx_http_html_ctx_t *)voidContext;
-
-	if(ctx->js_pos) {
-
-		//insert js_lib
-		ngx_append_chain(ctx,ctx->begin,ctx->js_pos,0);
-		ctx->begin = ctx->js_pos;
-		if(ctx->out) {
-			ngx_chain_t* tmp_node;
-			for(tmp_node = ctx->out;tmp_node;tmp_node = tmp_node->next) {
-				if(tmp_node->next==NULL) {          
-					tmp_node->next = js_lib_node;
-					break;
-				}
-			}
-		}
-		else {
-			ctx->out = js_lib_node;
-		}
-
-		ctx->js_pos = NULL;
-	}
 
 	if(!ngx_strcmp(name,"script")) {
 		ctx->type=T_JS;
@@ -810,7 +788,7 @@ static void CdataBlock(void *voidContext, xmlChar *chars, int length)
 
 	}
 	else if(ctx->type==T_CSS) {
-		
+
 		tag_end = ngx_strstr(ctx->begin,"</style");
 		if(tag_end) {
 			ngx_update_css(ctx,tag_end-length,length,0);
@@ -821,7 +799,6 @@ static void CdataBlock(void *voidContext, xmlChar *chars, int length)
 	}
 	return;
 }
-
 
 static void
 ngx_init_pcre()
@@ -869,7 +846,7 @@ ngx_init_pcre()
 }
 
 /*
-	0--html, update js_pos
+	0--html
 	1--js
 	2--css
 	-1--other,keep unchanged
@@ -881,9 +858,6 @@ ngx_detect_content_type(ngx_http_html_ctx_t *ctx)
 	ngx_http_request_t *r=ctx->r;
 	u_char *ch=ctx->buf.data;
 	u_char *end=ctx->buf.data+ctx->size;
-	u_char *html_tag;
-	u_char *head_tag;
-	u_char *tmp;
 
 	if(!r->headers_out.content_type.data) return T_OTHER;
 
@@ -895,20 +869,7 @@ ngx_detect_content_type(ngx_http_html_ctx_t *ctx)
 
 		//if first non-space char is '<', it's probally a html
 		if(*ch=='<') {
-			//find js_pos
-			head_tag=ngx_strcasestr(ch,"head");
-			if(head_tag && head_tag<end) {
-				tmp = memchr(head_tag,'>',end-head_tag);
-				ctx->js_pos=tmp+1;
-				return T_HTML;
-			}
-			html_tag=ngx_strcasestr(ch,"html");
-			if(html_tag && html_tag<end) {
-				tmp = memchr(html_tag,'>',end-html_tag);
-				ctx->js_pos=tmp+1;
-				return T_HTML;
-			}
-			ctx->js_pos=ctx->buf.data;
+			return T_HTML;
 		} 
 		else {
 			//may be js
@@ -996,12 +957,10 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-
-
 	ngx_chain_t *tmp;
 	unsigned int len=0;
 	int last_flag=0;
-	ngx_http_html_ctx_t     *ctx;
+ngx_http_html_ctx_t     *ctx;
 	int ret;
 	int  content_type;
 
@@ -1036,9 +995,9 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 	if (!last_flag) {
 		printf("36 in ngx_http_html_body_filter\n");
 		ret=ngx_http_next_body_filter(r, NULL);
+		//ret=ngx_http_next_body_filter(r, in);
 		return ret;
 	}
-
 
 	//detect content-type html/js/css
 
@@ -1051,13 +1010,8 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 		ctx->begin=ctx->buf.data;
 		ret = htmlParseChunk(ctx->ctxt, (char*)ctx->buf.data, ctx->size, 1);
 
-		ngx_append_chain(ctx,ctx->begin,ctx->buf.data+ctx->size,1);
-		/*
-		for(tmp=ctx->out;tmp;tmp=tmp->next) {
-			printf("final out\n%.*s\n============\n",tmp->buf->last,tmp->buf->pos,tmp->buf->pos);	
-		}
-		*/
-		printf("57 in ngx_http_html_body_filter\n");
+		ngx_append_chain(ctx,ctx->begin,ctx->buf.data+ctx->size,0);
+		ngx_append_chain(ctx,js_lib_buf->pos,js_lib_buf->last,1);
 		return ngx_http_next_body_filter(r, ctx->out);
 	}
 	else if(content_type==T_JS) {
@@ -1072,7 +1026,7 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 		printf("69 in ngx_http_html_body_filter\n");
 		return ngx_http_next_body_filter(r, ctx->out);
 	}
-	printf("73 in ngx_http_html_body_filter\n");
+
 	return ngx_http_next_body_filter(r, ctx->out);
 }
 
@@ -1088,27 +1042,21 @@ static void *
 ngx_http_html_create_conf(ngx_conf_t *cf)
 {
 	ngx_http_html_loc_conf_t  *slcf;
-	ngx_buf_t *b;
 	ngx_int_t len;
 
 	ngx_init_pcre();
 
 	len = strlen(neti_js_lib_str);
 
-	b = ngx_create_temp_buf(cf->pool,len);
-	if(b==NULL) return NULL;
+	js_lib_buf = ngx_create_temp_buf(cf->pool,len);
+	if(js_lib_buf == NULL) return NULL;
 
-	js_lib_node = ngx_alloc_chain_link(cf->pool);
-	if(js_lib_node==NULL) return NULL;
 
-	ngx_memcpy(b->pos, neti_js_lib_str, len);
-	b->last = b->pos+len;   
-	b->temporary = 1;
-	b->memory = 1;          
-	b->last_buf = 0;
-
-	js_lib_node->buf = b;
-	js_lib_node->next=NULL;
+	ngx_memcpy(js_lib_buf->pos, neti_js_lib_str, len);
+	js_lib_buf->last = js_lib_buf->pos+len;   
+	js_lib_buf->temporary = 1;
+	js_lib_buf->memory = 1;          
+	js_lib_buf->last_buf = 1;
 
 	slcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_html_loc_conf_t));
 	if (slcf == NULL)
