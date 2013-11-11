@@ -495,6 +495,11 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 	pscf = ngx_http_get_module_srv_conf(r, ngx_http_permit_module);
 	rule = pscf->public_rules->elts;
 
+	/*
+	printf("in ngx_http_permition_handler return forbidden\n");
+	return NGX_HTTP_FORBIDDEN;
+	*/
+
 #if 1
 	//get host
 	printf("uri %.*s\n",r->uri.len,r->uri.data);
@@ -504,7 +509,7 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 		ngx_int_t ret;
 
 		ret = sscanf(r->uri.data,"/sslvpn/%*[^/]/%239[^/]/",ch_host);
-		if(ret != 1) return NGX_ERROR;
+		if(ret != 1) return NGX_OK;
 
 		host.len = strlen(ch_host);
 		host.data = ngx_pcalloc(r->pool,host.len);
@@ -512,7 +517,7 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 			ngx_memcpy(host.data,ch_host,host.len);
 		}
 		else {
-			return NGX_ERROR;
+			return NGX_OK;
 		}
 
 		printf("in permition host %s\n",host.data);
@@ -559,5 +564,5 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 	}
 */
 
-	return NGX_DECLINED;
+	return NGX_HTTP_FORBIDDEN;
 }
