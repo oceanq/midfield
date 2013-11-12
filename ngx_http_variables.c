@@ -48,6 +48,8 @@ static ngx_int_t ngx_http_variable_sslvpn_hostname(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_variable_sslvpn_path(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_variable_sslvpn_url(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_variable_server_addr(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_variable_server_port(ngx_http_request_t *r,
@@ -157,6 +159,7 @@ static ngx_http_variable_t  ngx_http_core_variables[] = {
     { ngx_string("sslvpn_host"), NULL, ngx_http_variable_sslvpn_host, 0, 0, 0 },
     { ngx_string("sslvpn_hostname"), NULL, ngx_http_variable_sslvpn_hostname, 0, 0, 0 },
     { ngx_string("sslvpn_path"), NULL, ngx_http_variable_sslvpn_path, 0, 0, 0 },
+    { ngx_string("sslvpn_url"), NULL, ngx_http_variable_sslvpn_url, 0, 0, 0 },
 
     { ngx_string("server_addr"), NULL, ngx_http_variable_server_addr, 0, 0, 0 },
 
@@ -1032,6 +1035,8 @@ ngx_http_variable_sslvpn_host(ngx_http_request_t *r,
 		}
 	}
 
+	printf("host %.*s\n",v->len,v->data);
+
 	return NGX_OK;
 }
 
@@ -1062,6 +1067,8 @@ ngx_http_variable_sslvpn_hostname(ngx_http_request_t *r,
 
 	v->len =  ngx_sprintf(v->data, "%s://%s/", proto,host) - v->data;
 
+	printf("host name %.*s\n",v->len,v->data);
+
 	return NGX_OK;
 }
 
@@ -1091,7 +1098,83 @@ ngx_http_variable_sslvpn_path(ngx_http_request_t *r,
 	}
 
 	v->len =  ngx_sprintf(v->data, "/sslvpn/%s/%s/", proto,host) - v->data;
+
+	printf("sslvpn path %.*s\n",v->len,v->data);
 	return NGX_OK;
+}
+
+#define NGX_DE_URL(start,end) \
+	do { \
+		u_char *tmp; \
+		for(tmp=start;tmp<end;tmp++){ \
+			if(*tmp>='A' && *tmp<='Z'){ \
+				*tmp=((*tmp+(26-DELTA)-'A')%26+'A'); \
+			} \
+			if(*tmp>='a' && *tmp<='z'){ \
+				*tmp=((*tmp+(26-DELTA)-'a')%26+'a'); \
+			} \
+		} \
+	}while(0)
+
+
+static ngx_int_t
+ngx_http_variable_sslvpn_url(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    v->len = 0;
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+
+	ngx_uint_t len;
+	u_char *start,*ch;
+
+	if(r->uri.data) {
+
+		if(ngx_strstr(r->uri.data,http_prefix_str.data)==r->uri.data) {
+			//starts with /sslvpn/http/
+			len = http_proto_str.len+r->uri.len-http_prefix_str.len+1;
+			v->data = ngx_pnalloc(r->pool, len);
+			if (v->data == NULL) {
+				return NGX_ERROR;
+			}
+
+			v->len = snprintf(v->data,len,"http://%.*s",r->uri.len-http_prefix_str.len,r->uri.data+http_prefix_str.len);
+			//decode
+			ch = memchr(v->data+http_proto_str.len,'/',v->len-http_proto_str.len);
+			if(ch) {
+				NGX_DE_URL(ch+1,v->data+v->len);
+			}
+		}
+		else if(ngx_strstr(r->uri.data,https_prefix_str.data)==r->uri.data) {
+			//starts with /sslvpn/https/
+			len = https_proto_str.len+r->uri.len-https_prefix_str.len+1;
+			v->data = ngx_pnalloc(r->pool, len);
+			if (v->data == NULL) {
+				return NGX_ERROR;
+			}
+			v->len = snprintf(v->data,len,"https://%.*s",r->uri.len-https_prefix_str.len,r->uri.data+https_prefix_str.len);
+			//decode
+			ch = memchr(v->data+http_proto_str.len,'/',v->len-http_proto_str.len);
+			if(ch) {
+				NGX_DE_URL(ch+1,v->data+v->len);
+			}
+		}
+		else {
+			v->data = ngx_pnalloc(r->pool, r->uri.len);
+			if (v->data == NULL) {
+				return NGX_ERROR;
+			}
+			v->len = snprintf(v->data,len,"%.s",r->uri.len,r->uri.data);
+		}
+
+		printf("end sslvpn url %.*s\n",v->len+1,v->data);
+
+		return NGX_OK;
+	}
+
+	return NGX_ERROR;
+
 }
 
 static ngx_int_t

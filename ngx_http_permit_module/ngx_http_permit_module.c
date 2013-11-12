@@ -295,7 +295,7 @@ ngx_http_permit_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 	ngx_conf_merge_uint_value(conf->default_permit,
 	                              prev->default_permit, 1);
 
-	printf("in merge num %d %d\n",conf->public_rules->nelts,conf->private_rules->nelts);
+	//printf("in merge num %d %d\n",conf->public_rules->nelts,conf->private_rules->nelts);
 	if (conf->public_rules == NULL) {
 		conf->public_rules = prev->public_rules;
 	}
@@ -499,6 +499,7 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 	printf("in ngx_http_permition_handler return forbidden\n");
 	return NGX_HTTP_FORBIDDEN;
 	*/
+	return NGX_OK;
 
 #if 1
 	//get host
