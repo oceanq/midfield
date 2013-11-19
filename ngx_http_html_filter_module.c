@@ -21,6 +21,7 @@
 #define LEN_QUEUE 30
 #define OVECCOUNT 30    /* should be a multiple of 3 */
 #define ngx_strcasestr(s1, s2)  strcasestr((const char *) s1, (const char *) s2)
+#define ngx_strcasecmp(s1, s2)  strcasecmp((const char *) s1, (const char *) s2)
 
 static void *ngx_http_html_create_conf(ngx_conf_t *cf);
 static char *ngx_http_html_merge_conf(ngx_conf_t *cf,void *parent, void *child);
@@ -44,6 +45,7 @@ typedef struct
 	ngx_chain_t *out;			//out chains
 	ngx_chain_t *busy;
 	ngx_int_t type;				//update in StartElement for CdataBlock
+	ngx_int_t content_type;
 	unsigned int req_len;
 	unsigned int content_len;
 
@@ -53,7 +55,8 @@ enum content_type {
 	T_OTHER=-1,
 	T_HTML,
 	T_JS,
-	T_CSS
+	T_CSS,
+	T_INIT
 };
 
 
@@ -152,6 +155,32 @@ int js_erroffset;
 const char *js_error;
 
 
+static int
+ngx_append_buf_to_chain(ngx_http_html_ctx_t *ctx, ngx_buf_t *b)
+{
+
+	ngx_chain_t *c,*tmp;
+	c = ngx_alloc_chain_link(ctx->r->pool);
+	if(c==NULL) return NGX_ERROR;
+
+	c->buf = b;
+	c->next=NULL;
+
+	if(ctx->out) {
+		for(tmp=ctx->out;tmp;tmp=tmp->next) {
+			if(tmp->next==NULL) {
+				tmp->next=c;
+				break;
+			}
+		}
+	}
+	else {
+		ctx->out=c;
+	}
+
+	return NGX_OK;
+}
+
 
 /*
 	malloc buf point to the pos and last, append the node to ctx->out
@@ -201,6 +230,7 @@ static int ngx_append_chain(ngx_http_html_ctx_t* ctx,u_char* pos,u_char* last, i
 	do {\
 		u_char *tmp; \
 		for(tmp=start_u;tmp<end_u;tmp++){ \
+			if(*tmp=='?') break; \
 			if(*tmp>='A' && *tmp<='Z'){ \
 				*tmp=((*tmp+DELTA-'A')%26+'A'); \
 			} \
@@ -210,14 +240,19 @@ static int ngx_append_chain(ngx_http_html_ctx_t* ctx,u_char* pos,u_char* last, i
 		} \
 	}while(0)
 
-static ngx_int_t
-ngx_encode_url(ngx_http_html_ctx_t *ctx,u_char *start,u_char *end)
+/*
+	null may be not error;
+*/
+static ngx_buf_t*
+ngx_encode_url(ngx_http_request_t *r,u_char *start,u_char *end)
 {
 	
 	u_char *ch,*ch_end;
 	ngx_uint_t len,size=0;
-
 	ngx_buf_t *b = NULL;
+
+	printf("r->uri %.*s\n",r->uri.len,r->uri.data);
+	printf("input %.*s\n",end-start,start);
 
 	if(ngx_strstr(start,http_proto_str.data)==start) {
 		//ch = start+sizeof("http://");
@@ -226,10 +261,18 @@ ngx_encode_url(ngx_http_html_ctx_t *ctx,u_char *start,u_char *end)
 		if(ch_end) {
 			//len = sizeof("/sslvpn/http/") + (ch_end-ch-1) + (end-ch_end-1);
 			len = http_prefix_str.len + (ch_end-ch) + (end-ch_end) +1;
-			b = ngx_create_temp_buf(ctx->r->pool,len);
-			if(b==NULL) return NGX_ERROR;
+			b = ngx_create_temp_buf(r->pool,len);
+			if(b==NULL) return NULL;
 			NGX_TR_URL(ch_end+1,end);
-			size = snprintf((char*)b->pos,len,"/sslvpn/http/%.*s/%.*s\n",ch_end-ch,ch,end-ch_end-1,ch_end+1);
+			size = snprintf((char*)b->pos,len,"/sslvpn/http/%.*s/%.*s",ch_end-ch,ch,end-ch_end-1,ch_end+1);
+			goto good;
+		}
+		else {
+			//<a href="http://news.baidu.com">
+			len = http_prefix_str.len + (end-ch) +1;
+			b = ngx_create_temp_buf(r->pool,len);
+			if(b==NULL) return NULL;
+			size = snprintf((char*)b->pos,len,"/sslvpn/http/%.*s/",end-ch,ch);
 			goto good;
 		}
 	}
@@ -240,50 +283,51 @@ ngx_encode_url(ngx_http_html_ctx_t *ctx,u_char *start,u_char *end)
 		if(ch_end) {
 			//len = sizeof("/sslvpn/https/") + (ch_end-ch-1) + (end-ch_end-1);
 			len = https_prefix_str.len + (ch_end-ch) + (end-ch_end) +1;
-			b = ngx_create_temp_buf(ctx->r->pool,len);
-			if(b==NULL) return NGX_ERROR;
+			b = ngx_create_temp_buf(r->pool,len);
+			if(b==NULL) return NULL;
 			NGX_TR_URL(ch_end+1,end);
-			size = snprintf((char*)b->pos,len,"/sslvpn/https/%.*s/%.*s\n",ch_end-ch,ch,end-ch_end-1,ch_end+1);
+			size = snprintf((char*)b->pos,len,"/sslvpn/https/%.*s/%.*s",ch_end-ch,ch,end-ch_end-1,ch_end+1);
 			goto good;
 		}
 	}
 	else if(*start=='/') {
-		if(ngx_strstr(ctx->r->uri.data,http_prefix_str.data)) {
-			//ch = ctx->r->uri.data + sizeof("/sslvpn/http/")-1;
-			ch = ctx->r->uri.data + http_prefix_str.len;
+		if(ngx_strstr(r->uri.data,http_prefix_str.data)) {
+			//ch = r->uri.data + sizeof("/sslvpn/http/")-1;
+			ch = r->uri.data + http_prefix_str.len;
 			ch_end = memchr(ch,'/',end-ch);
 			if(ch_end) {
 				//len = sizeof("/sslvpn/http/") + (ch_end-ch) + (end-start);
 				len = http_prefix_str.len + (ch_end-ch) + (end-start)+1;
-				b = ngx_create_temp_buf(ctx->r->pool,len);
-				if(b==NULL) return NGX_ERROR;
+				b = ngx_create_temp_buf(r->pool,len);
+				if(b==NULL) return NULL;
 				NGX_TR_URL(start,end);
 				size = snprintf((char*)b->pos,len,"/sslvpn/http/%.*s%.*s",ch_end-ch,ch,end-start,start);
 				goto good;
 			}
 		}
-		else if(ngx_strstr(ctx->r->uri.data,https_prefix_str.data)) {
-			//ch = ctx->r->uri.data + sizeof("/sslvpn/https/")-1;
-			ch = ctx->r->uri.data + https_prefix_str.len;
+		else if(ngx_strstr(r->uri.data,https_prefix_str.data)) {
+			//ch = r->uri.data + sizeof("/sslvpn/https/")-1;
+			ch = r->uri.data + https_prefix_str.len;
 			ch_end = memchr(ch,'/',end-ch);
 			if(ch_end) {
 				len = https_prefix_str.len + (ch_end-ch) + (end-start) +1;
-				b = ngx_create_temp_buf(ctx->r->pool,len);
-				if(b==NULL) return NGX_ERROR;
+				b = ngx_create_temp_buf(r->pool,len);
+				if(b==NULL) return NULL;
 				NGX_TR_URL(start,end);
 				size = snprintf((char*)b->pos,len,"/sslvpn/https/%.*s%.*s",ch_end-ch,ch,end-start,start);
 				goto good;
 			}
 		}
 		else {
-			return NGX_OK;
+			// uri.data does't start with /sslvpn/http/ /sslvpn/https/
+			return NULL;
 		}
 	}
 	else {
 		NGX_TR_URL(start,end);
-		printf("relative :%.*s\n",end-start,start);
-		ngx_append_chain(ctx,start,end,0);
-		return NGX_OK;
+		//printf("relative :%.*s\n",end-start,start);
+		//ngx_append_chain(ctx,start,end,0);
+		return NULL;
 	}
 
 good:
@@ -291,30 +335,11 @@ good:
 	b->temporary = 1;
 	b->memory = 1;
 	b->last_buf = 0;
-	printf("url %.*s\n",b->last-b->pos,b->pos);
+	//printf("url %.*s\n",b->last-b->pos,b->pos);
 
-	ngx_chain_t *c,*tmp;
-	c = ngx_alloc_chain_link(ctx->r->pool);
-	if(c==NULL) return NGX_ERROR;
-	c->buf = b;
-	c->next=NULL;
+	return b;
 
-	if(ctx->out) {
-		for(tmp=ctx->out;tmp;tmp=tmp->next) {
-			if(tmp->next==NULL) {
-				tmp->next=c;
-				break;
-			}
-		}
-	}
-	else {
-		ctx->out=c;
-	}
-
-	return NGX_OK;
 }
-
-
 
 static u_char*
 ngx_search_js_end(u_char *start,u_char *current,u_char *last)
@@ -468,8 +493,8 @@ ngx_update_js(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 		int size = 24+ovector[3]-ovector[2]+ovector[5]-ovector[4];
 		b = ngx_create_temp_buf(ctx->r->pool,size);
 		if(b==NULL) return 1;
-		snprintf((char*)b->pos,size,"neti_jslib_handle(%.*s, \"%.*s\")",ovector[3]-ovector[2],subject+ovector[2],ovector[5]-ovector[4],subject+ovector[4]);
-		b->last=b->pos+size;
+		int sz = snprintf((char*)b->pos,size,"neti_jslib_handle(%.*s, \"%.*s\")",ovector[3]-ovector[2],subject+ovector[2],ovector[5]-ovector[4],subject+ovector[4]);
+		b->last=b->pos+sz;
 		ngx_append_chain(ctx,b->pos,b->last,0);
 	}
 	else {
@@ -479,8 +504,8 @@ ngx_update_js(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 		int size = 25+ovector[7]-ovector[6]+ovector[9]-ovector[8]+(ctx->begin-(u_char*)subject)-ovector[10]; 
 		b = ngx_create_temp_buf(ctx->r->pool,size);
 		if(b==NULL) return 1;
-		snprintf((char*)b->pos,size,"neti_jslib_assign(%.*s, \"%.*s\",%.*s)",ovector[7]-ovector[6],subject+ovector[6],ovector[9]-ovector[8],subject+ovector[8],(ctx->begin-(u_char*)subject)-ovector[10],subject+ovector[10]);
-		b->last=b->pos+size;
+		int sz = snprintf((char*)b->pos,size,"neti_jslib_assign(%.*s, \"%.*s\",%.*s)",ovector[7]-ovector[6],subject+ovector[6],ovector[9]-ovector[8],subject+ovector[8],(ctx->begin-(u_char*)subject)-ovector[10],subject+ovector[10]);
+		b->last=b->pos+sz;
 		ngx_append_chain(ctx,b->pos,b->last,0);
 	}
 
@@ -528,8 +553,8 @@ ngx_update_js(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 			unsigned int size = 24+ovector[3]-ovector[2]+ovector[5]-ovector[4];
 			b = ngx_create_temp_buf(ctx->r->pool,size);
 			if(b==NULL) return 1;
-			snprintf((char*)b->pos,size,"neti_jslib_handle(%.*s, \"%.*s\")",ovector[3]-ovector[2],subject+ovector[2],ovector[5]-ovector[4],subject+ovector[4]);
-			b->last=b->pos+size;
+			int sz = snprintf((char*)b->pos,size,"neti_jslib_handle(%.*s, \"%.*s\")",ovector[3]-ovector[2],subject+ovector[2],ovector[5]-ovector[4],subject+ovector[4]);
+			b->last=b->pos+sz;
 			ngx_append_chain(ctx,b->pos,b->last,0);
 
 		}
@@ -540,8 +565,8 @@ ngx_update_js(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 			int size = 25+ovector[7]-ovector[6]+ovector[9]-ovector[8]+(ctx->begin-(u_char*)subject)-ovector[10]; 
 			b = ngx_create_temp_buf(ctx->r->pool,size);
 			if(b==NULL) return 1;
-			snprintf((char*)b->pos,size,"neti_jslib_assign(%.*s, \"%.*s\",%.*s)",ovector[7]-ovector[6],subject+ovector[6],ovector[9]-ovector[8],subject+ovector[8],(ctx->begin-(u_char*)subject)-ovector[10],subject+ovector[10]);
-			b->last=b->pos+size;
+			int sz = snprintf((char*)b->pos,size,"neti_jslib_assign(%.*s, \"%.*s\",%.*s)",ovector[7]-ovector[6],subject+ovector[6],ovector[9]-ovector[8],subject+ovector[8],(ctx->begin-(u_char*)subject)-ovector[10],subject+ovector[10]);
+			b->last=b->pos+sz;
 			ngx_append_chain(ctx,b->pos,b->last,0);
 		}
 
@@ -564,6 +589,7 @@ ngx_update_css(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 	char* subject;
 	int subject_length,rc;
 	int ovector[OVECCOUNT];
+	ngx_buf_t *b;
 
 
 	subject = (char*) start;
@@ -600,7 +626,9 @@ ngx_update_css(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 	ngx_append_chain(ctx,ctx->begin,(u_char*)subject+ovector[2*rc-2],0);
 	ctx->begin = (u_char*)subject+ovector[2*rc-1];
 	//printf("css %.*s\n",ovector[2*rc-1]-ovector[2*rc-2],subject+ovector[2*rc-2]);
-	ngx_encode_url(ctx,(u_char*)subject+ovector[2*rc-2],ctx->begin);
+	b = ngx_encode_url(ctx->r,(u_char*)subject+ovector[2*rc-2],ctx->begin);
+	if(b) ngx_append_buf_to_chain(ctx,b);
+	else ngx_append_chain(ctx,(u_char*)subject+ovector[2*rc-2],ctx->begin,0); 
 	//ngx_append_chain(ctx,(u_char*)subject+ovector[2*rc-2],ctx->begin,0); // part of value
 
 
@@ -642,7 +670,9 @@ ngx_update_css(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 		ngx_append_chain(ctx,ctx->begin,(u_char*)subject+ovector[2*rc-2],0);
 		ctx->begin = (u_char*)subject+ovector[2*rc-1];
 		//printf("css %.*s\n",ovector[2*rc-1]-ovector[2*rc-2],subject+ovector[2*rc-2]);
-		ngx_encode_url(ctx,(u_char*)subject+ovector[2*rc-2],ctx->begin);
+		b = ngx_encode_url(ctx->r,(u_char*)subject+ovector[2*rc-2],ctx->begin);
+		if(b) ngx_append_buf_to_chain(ctx,b);
+		else ngx_append_chain(ctx,(u_char*)subject+ovector[2*rc-2],ctx->begin,0);
 		//ngx_append_chain(ctx,(u_char*)subject+ovector[2*rc-2],ctx->begin,0); // part of value
 
 	}
@@ -668,19 +698,16 @@ ngx_buf_t* js_lib_buf;
 static void StartElement(void *voidContext, const xmlChar *name, const xmlChar **attrs)
 {
 	ngx_http_html_ctx_t *ctx;
-	//u_char* content_pos;
 	char* content_pos;
-	//u_char* tmp;
 	char* tmp;
-	//u_char* attribute_pos;
 	char* attribute_pos;
 	char* value_pos;
-	//u_char* tag_pos;
 	char* tag_pos;
 	int i,j;
 	int refresh_flag=0;
 	int content_flag=0;
 	int url_key_len;
+	ngx_buf_t *b;
 
 	ctx = (ngx_http_html_ctx_t *)voidContext;
 
@@ -724,7 +751,9 @@ static void StartElement(void *voidContext, const xmlChar *name, const xmlChar *
 							meta_url_start = meta_url_start +1;
 							ngx_append_chain(ctx,ctx->begin,(u_char*)meta_url_start,0); //the part before url value
 							ctx->begin=(u_char*)content_pos+ngx_strlen(attrs[i+1]);
-							ngx_encode_url(ctx,(u_char*)meta_url_start,ctx->begin);
+							b = ngx_encode_url(ctx->r,(u_char*)meta_url_start,ctx->begin);
+							if(b) ngx_append_buf_to_chain(ctx,b);
+							else ngx_append_chain(ctx,(u_char*)meta_url_start,ctx->begin,0);
 							//ngx_append_chain(ctx,(u_char*)meta_url_start,ctx->begin,0); // part of value
 						}
 					}
@@ -749,7 +778,9 @@ static void StartElement(void *voidContext, const xmlChar *name, const xmlChar *
 						if(value_pos) {
 							ngx_append_chain(ctx,ctx->begin,(u_char*)value_pos,0); //the part before url value
 							ctx->begin=(u_char*)value_pos+ngx_strlen(attrs[i+1]);
-							ngx_encode_url(ctx,(u_char*)value_pos,ctx->begin);
+							b = ngx_encode_url(ctx->r,(u_char*)value_pos,ctx->begin);
+							if(b) ngx_append_buf_to_chain(ctx,b);
+							else ngx_append_chain(ctx,(u_char*)value_pos,ctx->begin,0); 
 							//ngx_append_chain(ctx,(u_char*)value_pos,ctx->begin,0); // part of value
 							break;
 						}
@@ -788,7 +819,9 @@ static void StartElement(void *voidContext, const xmlChar *name, const xmlChar *
 							if(url_end) {
 								ngx_append_chain(ctx,ctx->begin,url_start,0); //the part before url value
 								ctx->begin=url_end;
-								ngx_encode_url(ctx,url_start,ctx->begin);
+								b = ngx_encode_url(ctx->r,url_start,ctx->begin);
+								if(b) ngx_append_buf_to_chain(ctx,b);
+								else ngx_append_chain(ctx,url_start,ctx->begin,0);
 								//ngx_append_chain(ctx,url_start,ctx->begin,0); // part of value
 							}
 						}
@@ -799,7 +832,9 @@ static void StartElement(void *voidContext, const xmlChar *name, const xmlChar *
 							if(url_end) {
 								ngx_append_chain(ctx,ctx->begin,url_start,0); //the part before url value
 								ctx->begin=url_end;
-								ngx_encode_url(ctx,url_start,ctx->begin);
+								b = ngx_encode_url(ctx->r,url_start,ctx->begin);
+								if(b) ngx_append_buf_to_chain(ctx,b);
+								else ngx_append_chain(ctx,url_start,ctx->begin,0); 
 								//ngx_append_chain(ctx,url_start,ctx->begin,0); // part of value
 							}
 						}
@@ -944,28 +979,32 @@ ngx_init_pcre()
 */
 
 static ngx_int_t
-ngx_detect_content_type(ngx_http_html_ctx_t *ctx)
+ngx_detect_content_type(ngx_http_request_t *r,ngx_chain_t *in)
 {
-	ngx_http_request_t *r=ctx->r;
-	u_char *ch=ctx->buf.data;
-	u_char *end=ctx->buf.data+ctx->size;
+	u_char *ch;
+	ngx_chain_t *tmp;
 
-	if(!r->headers_out.content_type.data) return T_OTHER;
+	if(!r->headers_out.content_type.data) {
+		return T_OTHER;
+	}
 
 	if(ngx_strcasestr(r->headers_out.content_type.data,"text/html") ||
 		ngx_strcasestr(r->headers_out.content_type.data,"text/htm") ||
 		ngx_strcasestr(r->headers_out.content_type.data,"text/xml")) {
 
-		while(ch<end && isspace(*ch)) ch++;
-
-		//if first non-space char is '<', it's probally a html
-		if(*ch=='<') {
-			return T_HTML;
-		} 
-		else {
-			//may be js
-			return T_JS;
+		for(tmp=in;tmp;tmp=tmp->next) {
+			ch = tmp->buf->pos;
+			while(ch<tmp->buf->last && isspace(*ch)) ch++;
+			if(ch>=tmp->buf->last) continue;
+			if(*ch=='<') {
+				return T_HTML;
+			} 
+			else {
+				return T_JS;
+			}
 		}
+
+		return T_OTHER;
 
 	}
 	else if (ngx_strcasestr(r->headers_out.content_type.data,"text/javascript") ||
@@ -979,6 +1018,7 @@ ngx_detect_content_type(ngx_http_html_ctx_t *ctx)
 		return T_CSS;
 	}
 	else {
+		printf("type %d\n",T_OTHER);
 		return T_OTHER;
 	}
 
@@ -1002,8 +1042,46 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 	ngx_http_html_loc_conf_t *slcf;
 
 
-	printf("uri %.*s content-length %d\n",r->uri.len,r->uri.data,r->headers_out.content_length_n);
+	printf("uri %.*s \n",r->uri.len,r->uri.data);
+
+	if(r->headers_out.status == NGX_HTTP_MOVED_TEMPORARILY) {
+#if 1 
+		unsigned int i;
+		ngx_list_part_t *part;
+		ngx_table_elt_t *header;
+		part = &r->headers_out.headers.part;  
+		header = part->elts;
+		for (i=0;;i++)
+		{  
+			if (i >= part->nelts) 
+			{
+				if (part->next == NULL)        
+				{
+					break;
+				}
+				part = part->next;
+				header = part->elts;           
+				i = 0;            
+			}
+			if (header[i].key.data && !ngx_strcasecmp("Location",header[i].key.data)) {
+				printf("key %s value %s\n",header[i].key.data,header[i].value.data);
+				ngx_buf_t *b;
+				b = ngx_encode_url(r,header[i].value.data,header[i].value.data+header[i].value.len);
+				if(b==NULL) return ngx_http_next_header_filter(r);
+				header[i].value.len = b->last-b->pos; 
+				header[i].value.data = b->pos;
+				return ngx_http_next_header_filter(r);
+
+			}
+		}
+
+#endif
+		return ngx_http_next_header_filter(r);
+	}
+
+
 	if (r->headers_out.status != NGX_HTTP_OK || r != r->main) {
+		printf("status %d\n",r->headers_out.status);
 		return ngx_http_next_header_filter(r);
 	}
 
@@ -1013,28 +1091,6 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 	}
 	if(slcf->enable == 0) return ngx_http_next_header_filter(r);
 
-#if 0 
-	int i;
-	ngx_list_part_t *part;
-	ngx_table_elt_t *header;
-	part = &r->headers_out.headers.part;  
-	header = part->elts;
-	for (i=0;;i++)
-	{  
-		if (i >= part->nelts) 
-		{
-			if (part->next == NULL)        
-			{
-				break;
-			}
-			part = part->next;
-			header = part->elts;           
-			i = 0;            
-		}
-		printf("key %s value %d\n",header[i].key.data,header[i].value.data);
-	}
-
-#endif
 
 
 	ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_html_ctx_t));
@@ -1048,6 +1104,8 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 	ctx->size=0;
 	ctx->type=T_OTHER;
 	ctx->req_len = 0;
+	ctx->content_type=T_INIT;
+
 	if(r->headers_out.content_length_n>0) {
 		ctx->content_len = r->headers_out.content_length_n;
 		ctx->buf.len=r->headers_out.content_length_n;
@@ -1073,6 +1131,7 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 	ngx_http_clear_content_length(r);
 	ngx_http_clear_accept_ranges(r);
 
+
 	return ngx_http_next_header_filter(r);
 }
 
@@ -1093,13 +1152,13 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 	int last_flag=0;
 	ngx_http_html_ctx_t     *ctx;
 	int ret;
-	int  content_type;
 	ngx_http_html_loc_conf_t *slcf;
 
 	slcf = ngx_http_get_module_loc_conf(r, ngx_http_html_filter_module);
 	if(slcf == NULL) {
 		return NGX_ERROR;
 	}
+
 	if(slcf->enable == 0) return ngx_http_next_body_filter(r, in);
 
 	ctx = ngx_http_get_module_ctx(r, ngx_http_html_filter_module);
@@ -1107,8 +1166,11 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 	{
 		return ngx_http_next_body_filter(r, in);
 	}
+	if(ctx->content_type == T_INIT) {
+		ctx->content_type = ngx_detect_content_type(r,in);
+	}
+	if(ctx->content_type == T_OTHER) return ngx_http_next_body_filter(r, in);
 
-	printf("uri %.*s\n",r->uri.len,r->uri.data);
 	for(tmp=in;tmp;tmp=tmp->next) {
 		len=tmp->buf->last-tmp->buf->pos;
 		ctx->req_len += len;
@@ -1146,10 +1208,8 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 		if(tmp->next==NULL) break;
 	}
 
-	printf("last flag %d\n",last_flag);
 	if(last_flag==0) {
 		ret = ngx_http_next_body_filter(r, NULL);
-		printf("ret %d\n",ret);
 		return ret;
 	}
 	/*
@@ -1159,15 +1219,13 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 	return ret;
 	*/
 
-	printf("last flag %d req len %d\n",last_flag,ctx->req_len);
 	//detect content-type html/js/css
 	if(ctx->buf.data == NULL) { 
-		printf("ctx->buf null\n");
 		return NGX_ERROR;
 	}
-	content_type = ngx_detect_content_type(ctx);
+
 	ctx->begin=ctx->buf.data;
-	if(content_type==T_HTML) {
+	if(ctx->content_type==T_HTML) {
 		if (ctx->ctxt == NULL) {
 			ctx->ctxt = htmlCreatePushParserCtxt(&saxHandler, ctx, "", 0, "", 
 					xmlDetectCharEncoding(ctx->buf.data,ctx->size));
@@ -1178,14 +1236,12 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 		ngx_append_chain(ctx,js_lib_buf->pos,js_lib_buf->last,1);
 		return ngx_http_next_body_filter(r, ctx->out);
 	}
-	else if(content_type==T_JS) {
-		printf("get js\n");
+	else if(ctx->content_type==T_JS) {
 		ngx_update_js(ctx,ctx->buf.data,ctx->size,1);
 		ngx_append_chain(ctx,ctx->begin,ctx->buf.data+ctx->size,1);
 		return ngx_http_next_body_filter(r, ctx->out);
 	}
-	else if(content_type==T_CSS) {
-		printf("get css\n");
+	else if(ctx->content_type==T_CSS) {
 		ngx_update_css(ctx,ctx->buf.data,ctx->size,1);
 		ngx_append_chain(ctx,ctx->begin,ctx->buf.data+ctx->size,1);
 		return ngx_http_next_body_filter(r, ctx->out);
