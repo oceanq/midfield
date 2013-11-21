@@ -29,6 +29,7 @@ static ngx_int_t ngx_http_html_filter_init(ngx_conf_t *cf);
 
 ngx_user_session *head=NULL;
 service *service_head=NULL;
+ngx_str_t jslib_str;
 
 typedef struct
 {
@@ -38,13 +39,14 @@ typedef struct
 typedef struct
 {
 	ngx_http_request_t *r;
+	u_char *begin;				//where to match url
+	u_char *tag_start;
+	u_char *tag_end;
+	u_char *jslib_pos;
+	ngx_chain_t *out;			//out chains
 	htmlParserCtxtPtr  ctxt;
 	ngx_str_t buf;				//whole response buf
 	unsigned int size;			//current size
-	u_char *begin;				//where to match url
-	ngx_chain_t *out;			//out chains
-	ngx_chain_t *busy;
-	ngx_int_t type;				//update in StartElement for CdataBlock
 	ngx_int_t content_type;
 	unsigned int req_len;
 	unsigned int content_len;
@@ -251,9 +253,6 @@ ngx_encode_url(ngx_http_request_t *r,u_char *start,u_char *end)
 	ngx_uint_t len,size=0;
 	ngx_buf_t *b = NULL;
 
-	printf("r->uri %.*s\n",r->uri.len,r->uri.data);
-	printf("input %.*s\n",end-start,start);
-
 	if(ngx_strstr(start,http_proto_str.data)==start) {
 		//ch = start+sizeof("http://");
 		ch = start+http_proto_str.len;
@@ -458,6 +457,8 @@ ngx_update_js(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 	subject = (char*) start;
 	subject_length = len;
 
+	//printf("js subject %.*s\n",len,start);
+
 	rc = pcre_exec(
 			js_re,                   /* the compiled pattern */
 			NULL,                 /* no extra data - we didn't study the pattern */
@@ -485,6 +486,9 @@ ngx_update_js(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 	}
 
 	if (rc == 0) rc = OVECCOUNT/3;
+
+	if(ovector[0]>=len) return 1;
+
 
 	if(*(subject+ovector[1]-1)=='(') {
 
@@ -544,6 +548,7 @@ ngx_update_js(ngx_http_html_ctx_t* ctx,u_char *start,int len,int flag)
 		}
 
 		if (rc == 0) rc = OVECCOUNT/3;
+		if(ovector[0]>=len) return 1;
 
 		if(*(subject+ovector[1]-1)=='(') {
 			//printf("function: neti_jslib_handle(%.*s, \"%.*s\")\n",ovector[3]-ovector[2],subject+ovector[2],ovector[5]-ovector[4],subject+ovector[4]);
@@ -689,11 +694,6 @@ END:
  * Descrip : find all urls and replace them            
  * ----------------------------------------------------------
  */
-#define KEYNAME_LEN 32
-#define neti_js_lib_str "<script type=\"text/javascript\" src=\"/js/neti_def.js\"></script>\n"
-#define comment_str "<!--nothing-->"
-
-ngx_buf_t* js_lib_buf;
 
 static void StartElement(void *voidContext, const xmlChar *name, const xmlChar **attrs)
 {
@@ -703,6 +703,7 @@ static void StartElement(void *voidContext, const xmlChar *name, const xmlChar *
 	char* attribute_pos;
 	char* value_pos;
 	char* tag_pos;
+	char* end_pos;
 	int i,j;
 	int refresh_flag=0;
 	int content_flag=0;
@@ -711,14 +712,55 @@ static void StartElement(void *voidContext, const xmlChar *name, const xmlChar *
 
 	ctx = (ngx_http_html_ctx_t *)voidContext;
 
-	if(!ngx_strcmp(name,"script")) {
-		ctx->type=T_JS;
+	if(ctx->jslib_pos) {
+
+		if(!ngx_strcasecmp(name,"html")) {
+			//just update jslib_pos
+			tag_pos = ngx_strcasestr(ctx->begin,"<html");
+			if(tag_pos) {
+				end_pos = ngx_strchr(tag_pos,'>');
+				if(end_pos) {
+					ctx->jslib_pos = end_pos; 
+				}
+			}
+		}
+		else if(!ngx_strcasecmp(name,"head")) {
+			//insert neti_def.js here
+			tag_pos = ngx_strcasestr(ctx->begin,"<head");
+			if(tag_pos) {
+				end_pos = ngx_strchr(tag_pos,'>');
+				if(end_pos) {
+					ctx->jslib_pos = end_pos; 
+					printf("in head\n");
+					ngx_append_chain(ctx,ctx->begin,end_pos+1,0);
+					ngx_append_chain(ctx,jslib_str.data,jslib_str.data+jslib_str.len,0);
+					//insert neti_def.js here
+					ctx->begin = end_pos + 1;
+					ctx->jslib_pos = NULL;
+				}
+			}
+		}
+		else {
+			printf("in else\n");
+			// insert neti_def.js to ctx->jslib_pos
+			ngx_append_chain(ctx,ctx->begin,ctx->jslib_pos+1,0);
+			ngx_append_chain(ctx,jslib_str.data,jslib_str.data+jslib_str.len,0);
+			//insert neti_def.js here
+			ctx->begin = ctx->jslib_pos + 1;
+			ctx->jslib_pos = NULL;
+		}
 	}
-	else if(!ngx_strcmp(name,"style")) {
-		ctx->type=T_CSS;
+	if(!ngx_strcasecmp(name,"script")) {
+		ctx->tag_start = ngx_strcasestr(ctx->begin,(u_char*)name);
+		if(ctx->tag_start) {
+			ctx->tag_start = ngx_strchr(ctx->tag_start,'>');
+		}
 	}
-	else {
-		ctx->type=T_OTHER;
+	else if(!ngx_strcasecmp(name,"style")) {
+		ctx->tag_start = ngx_strcasestr(ctx->begin,(u_char*)name);
+		if(ctx->tag_start) {
+			ctx->tag_start = ngx_strchr(ctx->tag_start,'>');
+		}
 	}
 
 	if(attrs==NULL) return;
@@ -868,7 +910,31 @@ static void StartElement(void *voidContext, const xmlChar *name, const xmlChar *
  */
 static void EndElement(void *voidContext, const xmlChar *name)
 {
-//	printf("in EndElement\n");
+	ngx_http_html_ctx_t *ctx;
+
+	ctx = (ngx_http_html_ctx_t *)voidContext;
+	if(ctx->tag_start) {
+		//printf(" name %s tag start %x\n",name,ctx->tag_start);
+		if(!ngx_strcasecmp(name,"script")) {
+			ctx->tag_end = ngx_strcasestr(ctx->tag_start,"</script");
+			if(ctx->tag_end) {
+				//printf("end element %.*s\n",ctx->tag_end-ctx->tag_start,ctx->tag_start);
+				ngx_update_js(ctx,ctx->tag_start,ctx->tag_end-ctx->tag_start,0);
+			}
+		}
+		else if(!ngx_strcasecmp(name,"style")) {
+			ctx->tag_end = ngx_strcasestr(ctx->tag_start,"</style");
+			if(ctx->tag_end) {
+				//printf("end element %.*s\n",ctx->tag_end-ctx->tag_start,ctx->tag_start);
+				ngx_update_css(ctx,ctx->tag_start,ctx->tag_end-ctx->tag_start,0);
+			}
+		}
+		else {
+			printf("end name %s\n",name);
+		}
+	}
+	ctx->tag_start = NULL;
+	ctx->tag_end = NULL;
 	return;
 }
 /*
@@ -894,35 +960,6 @@ static void Comment(void *voidContext, const xmlChar *chars)
 #define HTML_BUF_SIZE 1024
 static void CdataBlock(void *voidContext, xmlChar *chars, int length)
 {
-	ngx_http_html_ctx_t *ctx;
-	char* tag_end;
-	//u_char* tag_end;
-
-	ctx = (ngx_http_html_ctx_t *)voidContext;
-
-	if(ctx->type==T_OTHER) {
-		return;
-	}
-	else if(ctx->type==T_JS) {
-		tag_end = ngx_strstr(ctx->begin,"</script");
-		if(tag_end) {
-			ngx_update_js(ctx,(u_char*)(tag_end-length),length,0);
-		}
-		else {
-			printf("js tag text matched error\n");
-		}
-
-	}
-	else if(ctx->type==T_CSS) {
-
-		tag_end = ngx_strstr(ctx->begin,"</style");
-		if(tag_end) {
-			ngx_update_css(ctx,(u_char*)(tag_end-length),length,0);
-		}
-		else {
-			printf("css tag text matched error\n");
-		}
-	}
 	return;
 }
 
@@ -1042,7 +1079,7 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 	ngx_http_html_loc_conf_t *slcf;
 
 
-	printf("uri %.*s \n",r->uri.len,r->uri.data);
+	//printf("uri %.*s \n",r->uri.len,r->uri.data);
 
 	if(r->headers_out.status == NGX_HTTP_MOVED_TEMPORARILY) {
 #if 1 
@@ -1064,7 +1101,7 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 				i = 0;            
 			}
 			if (header[i].key.data && !ngx_strcasecmp("Location",header[i].key.data)) {
-				printf("key %s value %s\n",header[i].key.data,header[i].value.data);
+				//printf("key %s value %s\n",header[i].key.data,header[i].value.data);
 				ngx_buf_t *b;
 				b = ngx_encode_url(r,header[i].value.data,header[i].value.data+header[i].value.len);
 				if(b==NULL) return ngx_http_next_header_filter(r);
@@ -1081,7 +1118,7 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 
 
 	if (r->headers_out.status != NGX_HTTP_OK || r != r->main) {
-		printf("status %d\n",r->headers_out.status);
+		//printf("status %d\n",r->headers_out.status);
 		return ngx_http_next_header_filter(r);
 	}
 
@@ -1102,7 +1139,6 @@ ngx_http_html_header_filter(ngx_http_request_t *r)
 
 	ctx->r=r;
 	ctx->size=0;
-	ctx->type=T_OTHER;
 	ctx->req_len = 0;
 	ctx->content_type=T_INIT;
 
@@ -1225,15 +1261,19 @@ ngx_http_html_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 	}
 
 	ctx->begin=ctx->buf.data;
+	ctx->jslib_pos = ctx->buf.data;
 	if(ctx->content_type==T_HTML) {
 		if (ctx->ctxt == NULL) {
 			ctx->ctxt = htmlCreatePushParserCtxt(&saxHandler, ctx, "", 0, "", 
-					xmlDetectCharEncoding(ctx->buf.data,ctx->size));
+					XML_CHAR_ENCODING_NONE);
+					//xmlDetectCharEncoding(ctx->buf.data,ctx->size));
 		}
 		ret = htmlParseChunk(ctx->ctxt, (char*)ctx->buf.data, ctx->size, 1);
+		htmlParseChunk(ctx->ctxt, "", 0, 1);
+		htmlFreeParserCtxt(ctx->ctxt);
 
-		ngx_append_chain(ctx,ctx->begin,ctx->buf.data+ctx->size,0);
-		ngx_append_chain(ctx,js_lib_buf->pos,js_lib_buf->last,1);
+
+		ngx_append_chain(ctx,ctx->begin,ctx->buf.data+ctx->size,1);
 		return ngx_http_next_body_filter(r, ctx->out);
 	}
 	else if(ctx->content_type==T_JS) {
@@ -1269,19 +1309,7 @@ ngx_http_html_create_conf(ngx_conf_t *cf)
 
 	ngx_init_pcre();
 
-	len = strlen(neti_js_lib_str);
-
-	js_lib_buf = ngx_create_temp_buf(cf->pool,len);
-	if(js_lib_buf == NULL) return NULL;
-
-
-
-	ngx_memcpy(js_lib_buf->pos, neti_js_lib_str, len);
-	js_lib_buf->last = js_lib_buf->pos+len;   
-	js_lib_buf->temporary = 1;
-	js_lib_buf->memory = 1;          
-	js_lib_buf->last_buf = 1;
-
+	ngx_str_set(&jslib_str,"\n<script type=\"text/javascript\" src=\"/js/neti_def.js\"></script>\n");
 
 	slcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_html_loc_conf_t));
 	if (slcf == NULL)
