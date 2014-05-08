@@ -401,13 +401,13 @@ $FCGI_MAX_REQUESTS_PER_PROCESS= 1000 ;
 #---- End of FastCGI configuration --------------
 
 sub myLog{
-	my($info)= @_ ;
+	my($line,$info)= @_ ;
 	open (Logfile, ">>/tmp/perl.log") ;
 	my($len) = tell(Logfile);
 	if($len>10240) {
 		truncate(Logfile,0);
 	}
-	print Logfile ($info."\n");
+	print Logfile ($line."-->".$info."\n");
 	close(Logfile);
 }
 
@@ -1796,9 +1796,6 @@ if ($ENV{'HTTP_HOST'} ne '') {
 } else {
     $THIS_HOST= $ENV{'SERVER_NAME'} ;
 }
-myLog('http_host'.$ENV{'HTTP_HOST'}."\n");
-myLog('server_name'.$ENV{'SERVER_NAME'}."\n");
-
 
 # Build the constant $THIS_SCRIPT_URL from environment variables.  Only include
 #   SERVER_PORT if it's not 80 (or 443 for SSL).
@@ -1869,7 +1866,6 @@ sub timeexit { goto EXIT }
 #   request URI, rather than just the part after the script name.  So fix it
 #   here if we're running on IIS.  Thanks to Dave Moscovitz for the info!
 $ENV{'PATH_INFO'} =~ s/^$ENV_SCRIPT_NAME//   if $RUNNING_ON_IIS ;
-myLog('path info'.$ENV{'PATH_INFO'});
 
 # The nginx server also doesn't set PATH_INFO, or even SCRIPT_NAME, correctly--
 #   it sets SCRIPT_NAME to the entire request URI, and PATH_INFO to nothing.  So fix it.
@@ -1914,9 +1910,6 @@ $env_accept= $ENV{'HTTP_ACCEPT'} || '*/*' ;     # may be modified later
 # Extract flags and encoded URL from PATH_INFO.
 ($lang, $packed_flags, $encoded_URL)= $ENV{'PATH_INFO'}=~ m#^/([^/]*)/?([^/]*)/?(.*)# ;
 
-myLog('lang'.$lang."\n");
-myLog('flags'.$packed_flags."\n");
-myLog('encoded url'.$encoded_URL."\n");
 $lang= $DEFAULT_LANG  if $lang eq '' ;
 
 # Set "dir" attribute based on %RTL_LANG .
@@ -2008,7 +2001,6 @@ $url_start=  $is_in_frame   ? $url_start_inframe   : $url_start_noframe ;
 
 # Decode the URL.
 $URL= &wrap_proxy_decode($encoded_URL) ;
-myLog('URL'.$URL."\n");
 
 
 # Set the query string correctly, from $ENV{QUERY_STRING} and what's already
@@ -2350,7 +2342,6 @@ $cookie_to_server= &get_cookies_from_db($path, $host, $port, $scheme)  if $USE_D
 #    Full response is sent back in these routines.
 #--------------------------------------------------------------------------
 
-myLog("http get $scheme\n");
 if ($scheme eq 'http') {
     &http_get ;
 } elsif ($scheme eq 'https') {
@@ -5120,6 +5111,11 @@ sub http_get {
 
 	# To make traffic fingerprinting harder.
 	shuffle(\@req_headers) ;
+	my $req_len=0;
+	my $req_item;
+	foreach $req_item (@req_headers) {
+		$req_len +=length($req_item);
+	}
 
 	# Send the request.
 	print S "$ENV{'REQUEST_METHOD'} $request_uri HTTP/$HTTP_VERSION\015\012",
@@ -5436,6 +5432,24 @@ sub http_get {
 		#   don't handle it, so remove it if found.
 		$charset= 'UTF-8' if $body=~ s/^\xef\xbb\xbf// ;
 
+		my($name,$value);
+		foreach ( split(/\s*;\s*/, $ENV{"HTTP_COOKIE"} )) {
+			($name, $value)= split(/=/, $_) ;
+			if($name eq 'sslvpndata') {
+				my($username,$group)=split("#",$value);
+				if($group) {
+					use URI::Escape;
+					use MIME::Base64;
+					$username = uri_unescape($username);
+					$username = decode_base64($username);
+					myLog(__LINE__,$username.length($body)."#".length($headers)."#".$req_len);
+
+					#sendreportd username#length($body)+length($header)+req_len
+					#db write username#length($body)+length($header)+req_len
+				}
+				last;
+			}
+		}
 		# Decode $body for text resources.
 		if ($content_type=~ m#^text/#) {
 		    eval { $body= decode($charset || 'ISO-8859-1', $body) } ;
@@ -5579,6 +5593,24 @@ sub http_get {
 			undef $/ ;
 			$body= <S> ;
 		    }
+			my($name,$value);
+			foreach ( split(/\s*;\s*/, $ENV{"HTTP_COOKIE"} )) {
+				($name, $value)= split(/=/, $_) ;
+				if($name eq 'sslvpndata') {
+					my($username,$group)=split("#",$value);
+					if($group) {
+						use URI::Escape;
+						use MIME::Base64;
+						$username = uri_unescape($username);
+						$username = decode_base64($username);
+						myLog(__LINE__,$username.length($body)."#".length($headers)."#".$req_len);
+
+						#sendreportd username#length($body)+length($header)+req_len
+						#db write username#length($body)+length($header)+req_len
+					}
+					last;
+				}
+			}
 
 		    shutdown(S, 0)  if $RUNNING_ON_IIS ;  # without this, IIS+MSIE hangs
 
