@@ -5443,6 +5443,10 @@ sub http_get {
 					$username = uri_unescape($username);
 					$username = decode_base64($username);
 					myLog(__LINE__,$username.length($body)."#".length($headers)."#".$req_len);
+					my $traffic=$req_len+length($body)+length($headers);
+					my $cmd="t_reportd 13 0#0#0#0#0#0#".$username."#4#".$traffic." 0 ip type user &";
+					system($cmd);
+					myLog(__LINE__,$cmd);
 
 					#sendreportd username#length($body)+length($header)+req_len
 					#db write username#length($body)+length($header)+req_len
@@ -5604,6 +5608,10 @@ sub http_get {
 						$username = uri_unescape($username);
 						$username = decode_base64($username);
 						myLog(__LINE__,$username.length($body)."#".length($headers)."#".$req_len);
+						my $traffic=$req_len+length($body)+length($headers);
+						my $cmd="t_reportd 13 0#0#0#0#0#0#".$username."#4#".$traffic." 0 ip type user &";
+						system($cmd);
+						myLog(__LINE__,$cmd);
 
 						#sendreportd username#length($body)+length($header)+req_len
 						#db write username#length($body)+length($header)+req_len
