@@ -399,6 +399,41 @@ $FCGI_MAX_REQUESTS_PER_PROCESS= 1000 ;
 
 
 #---- End of FastCGI configuration --------------
+sub mark_traffic{
+	my($username,$req_len,$res_len)=@_;
+	my $traffic=$req_len+$res_len;
+	my $cmd="/neteye/bin/t_reportd 13 0#0#0#0#0#0#".$username."#4#".$traffic." 0 ip type user &";
+	system($cmd);
+	myLog(__LINE__,$cmd);
+
+	use DBI;
+
+	my $db_file="dbi:SQLite:dbname=/neteye/etc/new_db/vpn";
+	my $dbh = DBI->connect($db_file,"","");
+
+	my $query="select in_bytes,out_bytes from sslvpn_session where username=?";
+	my $sth= $dbh->prepare($query);
+	$sth->execute($username);
+
+	my $res = $sth->fetch();
+
+	if(length($res)==0){
+		my $insert="insert into sslvpn_session values('%s',%lu,%lu,%lu)";
+		$insert=sprintf($insert,$username,$req_len,$res_len,time());
+		$dbh->do($insert);
+		myLog(__LINE__,$insert);
+	}
+	else {
+		my $update="update sslvpn_session set out_bytes=out_bytes+%lu,in_bytes=in_bytes+%lu,last_visit=%lu where username='%s';";
+		$update=sprintf($update,$req_len,$res_len,time(),$username);
+		myLog(__LINE__,$update);
+		$dbh->do($update);
+	}
+
+	$sth->finish();
+	$dbh->disconnect();
+
+}
 
 sub myLog{
 	my($line,$info)= @_ ;
@@ -5443,11 +5478,8 @@ sub http_get {
 					$username = uri_unescape($username);
 					$username = decode_base64($username);
 					myLog(__LINE__,$username.length($body)."#".length($headers)."#".$req_len);
-					my $traffic=$req_len+length($body)+length($headers);
-					my $cmd="t_reportd 13 0#0#0#0#0#0#".$username."#4#".$traffic." 0 ip type user &";
-					system($cmd);
-					myLog(__LINE__,$cmd);
-
+					my $res_len=length($body)+length($headers);
+					mark_traffic($username,$req_len,$res_len);
 					#sendreportd username#length($body)+length($header)+req_len
 					#db write username#length($body)+length($header)+req_len
 				}
@@ -5608,10 +5640,8 @@ sub http_get {
 						$username = uri_unescape($username);
 						$username = decode_base64($username);
 						myLog(__LINE__,$username.length($body)."#".length($headers)."#".$req_len);
-						my $traffic=$req_len+length($body)+length($headers);
-						my $cmd="t_reportd 13 0#0#0#0#0#0#".$username."#4#".$traffic." 0 ip type user &";
-						system($cmd);
-						myLog(__LINE__,$cmd);
+						my $res_len=length($body)+length($headers);
+						mark_traffic($username,$req_len,$res_len);
 
 						#sendreportd username#length($body)+length($header)+req_len
 						#db write username#length($body)+length($header)+req_len
