@@ -217,6 +217,85 @@ ngx_http_permit_init(ngx_conf_t *cf)
 	return NGX_OK;
 }
 
+
+enum {
+	INIT,
+	BEGIN,
+	TWO,
+	THREE,
+	END
+};
+
+
+u_char *unescape_base64_in_cookie(u_char *src,int len)
+{
+	u_char *dst,*ch,*d;
+	int state = INIT;
+
+	dst = malloc(len+1);
+	if(!dst) return NULL;
+	memset(dst,0,len+1);
+
+	d = dst;
+	ch = src;
+	while(len--) {
+		switch(state) {
+			case INIT:
+				if(*ch=='%') {
+					state = BEGIN; 
+				}
+				else {
+					*d++ = *ch;
+				}
+				ch++;
+				break;
+			case BEGIN:
+				if(*ch=='2') {
+					state = TWO;
+				}
+				else if(*ch=='3') {
+					state = THREE;
+				}
+				else {
+					*d++ = '%';
+					*d++ = *ch;
+					state = INIT;
+				}
+				ch++;
+				break;
+			case TWO:
+				if(*ch=='B') {
+					*d++ = '+';
+				}
+				else if(*ch=='F') {
+					*d++ = '/';
+				}
+				else {
+					*d++ = '%';
+					*d++ = '2';
+					*d++ = *ch;
+				}
+				ch++;
+				state = INIT;
+				break;
+			case THREE:
+				if(*ch=='D') {
+					*d++ = '=';
+				}
+				else {
+					*d++ = '%';
+					*d++ = '3';
+					*d++ = *ch;
+				}
+				ch++;
+				state = INIT;
+				break;
+		}
+	}
+	return dst;
+}
+
+
 static ngx_int_t
 ngx_http_permition_handler(ngx_http_request_t *r)
 {
@@ -225,9 +304,9 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 	ngx_http_permit_rule_t *rule;
 	ngx_list_part_t *p ; 
 	ngx_uint_t i,j;
-	u_char *cookie;
-	u_char *start,*user,*group;
-	group = NULL;
+	u_char *cookie,*start;
+	ngx_str_t user,group;
+	ngx_str_t escaped_user,escaped_group;
 
 	pscf = ngx_http_get_module_srv_conf(r, ngx_http_permit_module);
 	plcf = ngx_http_get_module_loc_conf(r, ngx_http_permit_module);
@@ -293,17 +372,38 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 					memset(cookie,0,header[i].value.len+1);
 					ngx_memcpy(cookie,header[i].value.data,header[i].value.len);
 
-					group = NULL;
+					group.data = NULL;
+					u_char *matched,*escaped_cookie;
 					start = strtok(cookie,";");
 					while(start) {
-						user = strstr(start,"sslvpndata=");
-						if(user) {
-							group = strstr(start,"#");
-							if(group) {
-								*group='\0';
-								group +=1;
-								user+=strlen("sslvpndata=");
-								printf("app %s user %s group %s\n",app,user,group);
+						matched = strstr(start,"sslvpndata=");
+						if(matched) {
+							escaped_cookie = unescape_base64_in_cookie(matched,strlen(matched));
+							if(!escaped_cookie) return NGX_HTTP_FORBIDDEN;
+							printf("escaped cookie %s\n",escaped_cookie);
+							group.data = strstr(escaped_cookie,"#");
+							if(group.data) {
+								*(group.data)='\0';
+								user.data = escaped_cookie + strlen("sslvpndata=");
+								user.len = group.data - user.data;
+								if (ngx_decode_base64(&escaped_user, &user) != NGX_OK) {
+									return NGX_HTTP_FORBIDDEN;
+								}
+								*(escaped_user.data+escaped_user.len) = '\0';
+
+								group.data +=1;
+								group.len  = strlen(group.data);
+
+								if (ngx_decode_base64(&escaped_group, &group) != NGX_OK) {
+									return NGX_HTTP_FORBIDDEN;
+								}
+								*(escaped_group.data+escaped_group.len) = '\0';
+
+								printf("app %s user %s group %s\n",app,user.data,group.data);
+								printf("escaped %s len %d\n",escaped_user.data,escaped_user.len);
+								printf("escaped %s len %d\n",escaped_group.data,escaped_group.len);
+
+
 
 								//check groupname and appname, if appname == username means this app is self defined 
 								p = &(pscf->rules->part);
@@ -315,17 +415,17 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 									}
 									else if(!strcmp(rule[j].app.data,"any")) {
 										//app any
-										if(!strcmp(rule[j].usergroup.data,group)) break; 
+										if(!strcmp(rule[j].usergroup.data,group.data)) break; 
 									}
 									else {
-										if(!strcmp(rule[j].usergroup.data,group) && !strcmp(rule[j].app.data,app)) {
+										if(!strcmp(rule[j].usergroup.data,group.data) && !strcmp(rule[j].app.data,app)) {
 											break;
 										}
 									}
 								}
 								if(j>=p->nelts) {
 									//maybe self defined
-									if(!strcmp(app,user)) return NGX_OK;
+									if(!strcmp(app,user.data)) return NGX_OK;
 									else {
 										if(pscf->default_permit) return NGX_OK;
 										else return NGX_HTTP_FORBIDDEN;
@@ -343,12 +443,12 @@ ngx_http_permition_handler(ngx_http_request_t *r)
 						}
 						start = strtok(NULL,";");
 					}
-					if(!group) return NGX_HTTP_FORBIDDEN;
+					if(!group.data) return NGX_HTTP_FORBIDDEN;
 					break;
 				}
 			}
 			//not found cookie
-			if(!group) return NGX_HTTP_FORBIDDEN;
+			if(!group.data) return NGX_HTTP_FORBIDDEN;
 
 		}
 		else {
